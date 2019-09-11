@@ -10,7 +10,7 @@
 # However you can change user ID to your ID to running it
 # Invertory build script version 1.00
 # Before running this script , make sure the scp should works in remote server
-# with authrization key. (No need password to login remote server) in User ID: zko9ycn
+# with authrization key. (No need password to login remote server) in User ID
 # the hosts list flile name is  <hosts-list> in /tmp/hosts-list
 # final report stored on /tmp/ait-all-final-report.txt
 # 

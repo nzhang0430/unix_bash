@@ -1,0 +1,97 @@
+#!/bin/bash
+
+#################################################
+#
+# Author: Frank Zhang  
+#
+# Version 1.00
+# Running this script 
+# Keep User ID same as agent's script User ID  
+# However you can change user ID to your ID to running it
+# Invertory build script version 1.00
+# Before running this script , make sure the scp should works in remote server
+# with authrization key. (No need password to login remote server) in User ID: zko9ycn
+# the hosts list flile name is  <hosts-list> in /tmp/hosts-list
+# final report stored on /tmp/ait-all-final-report.txt
+# 
+#
+#################################################
+
+#set -x
+
+typeset RHOSTS=
+
+NUMHOSTS=$(cat  /tmp/hosts-list | wc -l)
+
+i=1
+
+cat  /tmp/hosts-list | \
+
+while read line ; do
+
+        RHOSTS="$line"
+
+        echo "$RHOSTS"
+
+###############################
+#
+# Download ait report from each nodes on network
+# and store on /tmp/ait-latest-report.$i
+#
+###############################
+        scp  $RHOSTS:/tmp/ait-latest-report   /tmp/ait-latest-report.$i
+
+        i=$((i + 1))
+
+#        echo $i
+
+        sleep 5
+
+done
+
+##################
+#
+# Build single invertory file
+#
+##################
+typeset TEMP="$(mktemp)"
+
+for j in $(seq 1 $NUMHOSTS); do
+
+        if [ j = 1 ]; then
+                
+				cat /tmp/ait-latest-report.$j >  "$TEMP"
+
+        else
+
+                cat /tmp/ait-latest-report.$j  >> "$TEMP"
+        fi
+
+done
+
+#################
+#
+# Foramt invertory file
+# final report save in /tmp/ait-all-final-report.txt
+#
+#################
+
+# Only cut 1st line of  file <"$TEMP"> and copy to /tmp/ait-all-final-report.txt
+cat "$TEMP" | sed -n 1p > /tmp/ait-all-final-report.txt
+
+cat  "$TEMP" | \
+while read line ; do
+        
+		typeset GETLINE=$(echo "$line" | awk '{print $1 }')
+        
+		if [ "$GETLINE" != Host_Name ]; then
+
+            echo "$line" >> /tmp/ait-all-final-report.txt
+
+        fi
+
+
+done
+rm -f  "$TEMP"
+rm -r /tmp/ait-latest-report.*
+#END

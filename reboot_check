@@ -1,0 +1,351 @@
+#! /bin/bash
+#
+# post_reboot_check_tx_v2.9 
+#
+# Return codes:
+#   0 - Batch process may continue to the next server in line to reboot.
+#   1 - The next server should *not* be rebooted yet, but this test should
+#        be run again (i.e. not ready yet / keep trying).
+#   2 - Something horrible has gone wrong and the entire reboot batch should
+#        be aborted (no other servers should even be attempted).
+#
+
+#set -x
+
+PATH="/usr/bin:/bin:/usr/sbin:/sbin:/etc"
+
+umask 0022
+
+#####################
+#
+# To find laterest version of DSE
+#
+#####################
+typeset VERTEMP="$(mktemp)"
+
+ls -l /hosting/products/datastax |  grep dse- | awk '{print $9}' | cut -d '-' -f 2 > "$VERTEMP"  2>&1
+
+typeset DSE_VER=$(cat $VERTEMP | sort -nr | head -n1)
+
+rm  -f  $VERTEMP
+
+typeset DSE_DIR="/hosting/products/datastax/dse-$DSE_VER"
+
+typeset NODETOOL="$DSE_DIR/c0/dse-$DSE_VER/bin/dsetool"
+
+typeset CQLSH="$DSE_DIR/c0/dse-$DSE_VER/bin/cqlsh"
+
+typeset HOSTNAME=$(hostname -s)
+
+#############################
+#
+# If invoked as root, exec as casadmin.
+#
+#############################
+
+[ $(id -u) -eq 0 ] && exec su - casadmin "$(pwd)/$0" "$@"
+
+################################### 
+#
+# Detect DSE instances in Locat machine. Make sure 
+# all instances are up, otherwise will stop proceed.
+# test twice wait for 1 minute, if instances are down.
+#
+###################################
+
+typeset INSTANCE
+
+# INSTANCE can be c0, c1, c2....
+ 
+for INSTANCE in $(ls -1 "$DSE_DIR"); do
+
+			typeset -i INS_RUNNING=$(ps aux | grep -v grep |\
+							                           grep "[D]bofa.dse.instance=$INSTANCE" | wc -l)
+													   
+			if [ "$INS_RUNNING" -eq 0 ]; then
+				
+						echo "Process check failed; $INSTANCE not running,waiting the Instance Up... "  >&2
+						
+################################################
+#
+#	 added watching loop here , by Frank Zhang
+#   continue watching Instance, If 10 minutes not bring up 
+#   then , That Intance has error occured 
+#   Update on  Oct/2/2017
+# 
+################################################
+
+                        for i in `seq 1 60`; do
+
+                                INS_RUNNING=$(ps aux | grep -v grep |\
+							                           grep "[D]bofa.dse.instance=$INSTANCE" | wc -l)
+
+                                if [ "$INS_RUNNING" -eq 0 ]; then
+
+                                            if [ $i -eq 60 ]; then
+
+                                                echo  "$INSTANCE is down in 10 minutes, the error has occured at this instance"
+												 
+                                                echo "Aborting reboot sequence in VENPRODTX Data Center." >&2
+										        exit 2
+                                             
+											else
+######################
+#
+#	60 loop x 10 second = 10 minutes										 
+#
+# ####################                                          
+                                             sleep 10
+                                           
+										    fi
+
+                                else
+
+                                    echo "$INSTANCE Successful bring up"  >&2
+                                    break
+
+                                fi
+                            
+						done
+
+			else
+			
+					echo "Instance $INSTANCE running. OK." >&2
+			
+			fi
+
+done
+
+echo  " All Instances are  Up" >&2
+#############################################
+#
+# DataBase connection test
+# If we made it this far, keep looking status, if there's anything bad.
+# Test wait 10 minutes , If DB are down.
+#
+#############################################
+
+[ -x "$CQLSH" ] || {
+      
+	  echo "ERROR: Unable to execute $CQLSH." >&2    
+	  
+	  echo "Unexpected error, unable to determine health." >&2    
+	  
+	  echo "Aborting reboot sequence." >&2    
+	  
+	  exit 2			
+
+}
+
+for INSTANCE in $(ls -1 "$DSE_DIR"); do
+
+    if [ "X$HOST-$INSTANCE" = "X" ]; then    
+		
+		echo "ERROR: $HOST-$INSTANCE not defined." >&2    
+		
+		echo "Unexpected error, unable to determine health." >&2    
+		
+		echo "Aborting reboot sequence." >&2    
+		
+		exit 2
+    fi
+
+    if [ "$INSTANCE" = "c0" ];then
+		
+	typeset -i DB_TEST=$("$CQLSH" "$HOSTNAME" -u monitoring -p monitoring \
+                                            -e "select count(*) from monitoring.monitor;" | grep row | wc -l)
+	
+    else
+   
+    typeset -i DB_TEST=$("$CQLSH" "$HOSTNAME"-rpl -u monitoring -p monitoring \
+                                            -e "select count(*) from monitoring.monitor;" | grep row | wc -l)
+    fi
+	
+    if [ $DB_TEST -eq 1 ]; then
+
+        echo "Connection to DB instance $INSTANCE successful. "
+     	 
+    else
+
+        for i in `seq 1 60`; do
+		
+            if ["$INSTANCE" = "c0" ]; then
+			
+                DB_TEST=$("$CQLSH" "$HOSTNAME" -u monitoring -p monitoring \
+                                         -e "select count(*) from monitoring.monitor;" | grep row | wc -l)
+   
+            else
+
+                DB_TEST=$("$CQLSH" "$HOSTNAME"-rpl -u monitoring -p monitoring \
+                                         -e "select count(*) from monitoring.monitor;" | grep row | wc -l)
+			fi
+				
+				if [ $DB_TEST -ne 1 ]; then
+
+                        if [ $i -eq 60 ]; then
+
+                            echo  "DataBase is down in 10 minutes, the DB error occured at $INSTANCE"  >&2
+												 
+                            echo "Aborting reboot sequence in VENPRODTX Data Center." >&2
+	    			        exit 2
+                                             
+						else
+######################
+#
+#	60 loop x 10 second = 10 minutes										 
+#
+# ####################                                          
+                               sleep 10
+                                           
+					    fi
+
+                else
+
+                        echo "$INSTANCE DB has been successful connected"  >&2
+                        break
+
+                fi
+                            
+		done
+
+    fi		
+
+done
+
+echo "All DB are conected in each Instances"  >&2 
+
+#######################################
+# NODES test:
+# Instances and DB has been done in Above. 
+# Next step, To detect nodes on DSE ring. 
+# Make sure that no other nodes are down in the DSE Ring.
+#
+#######################################
+
+[ -x "$NODETOOL" ] || {
+          echo "ERROR: Unable to execute dsetool." >&2    
+		  echo "Unexpected error, unable to determine health." >&2    
+		  echo "Aborting reboot sequence." >&2    
+		  exit 2
+}
+
+typeset TMPFILE="$(mktemp)"
+
+$NODETOOL -h $HOSTNAME ring | grep VENPRODTX  >  "$TMPFILE"        2>&1
+
+typeset -i UP_NODES=$(grep Up "$TMPFILE" | wc -l)
+
+typeset -i DOWN_NODES=$(grep Down "$TMPFILE" | wc -l)
+
+if [ $UP_NODES -ne 0 ]; then
+		
+		echo "$UP_NODES nodes are up in the VENPRODTX Data Center."    >&2
+							
+        if [ $DOWN_NODES -gt 0 ]; then
+		        
+				typeset DOWN_IP="$(mktemp)"
+				
+		        grep Down "$TMPFILE" | awk '{print $1}' > "$DOWN_IP"
+					
+				echo "$DOWN_NODES nodes down in the VENPRODTX Data Center." >&2        
+					
+				grep Down "$TMPFILE" >&2        
+					
+				echo " Find some nodes down, Watching down nodes till bring Up"		
+
+########################################
+#
+# added: new by Frank Zhang
+# To contune watching down nodes
+# If done down in 10 minutes. then, 
+# we make a decision, that node has error occured 
+# date on  Oct/2/2017
+#
+###########################	#############			
+				
+				while IFS= read -r line ; do
+		                    
+							for i in `seq 1 60`; do
+
+ #                               count=$(ping -c5  "$line" | grep "received" | awk -F',' '{print $2 }' | awk '{print $1}')
+					        typeset UPDOWN=$($NODETOOL -h $HOSTNAME ring | grep "$line" | awk '{print $5 }')    
+ #                             if [ $count -eq 0 ]; then
+                                if [ "$UPDOWN" = "Down" ]; then
+
+                                            if [ $i -eq 60 ]; then
+
+                                                 echo  "$line is down in 10 minutes, the error has occured at this node" >&2
+												 
+                                                 echo "Aborting reboot sequence in VENPRODTX Data Center." >&2
+												 
+												 rm -f "$DOWN_IP"
+												 
+												 rm -f "$TMPFILE" 
+												 
+											     exit 2
+                                             
+											else
+######################
+#
+#	60 loop x 10 second = 10 minutes										 
+#
+# ####################                                          
+                                             sleep 10
+                                           
+										    fi
+
+                                elif [ "$UPDOW" = "Up" ]; then
+								
+                                    echo "Successful bring up node $line" >&2
+                                    
+									break
+
+                                else
+								
+								   echo "Cannot find the value of Up/Down, Please repair command awk at line 271 in the script $0" >&2
+								   
+								   echo "Aborting reboot sequence in VENPTDC1 Data Center." >&2
+								   
+								   rm -f "$DOWN_IP"
+								   
+								   rm -f "$TMPFILE"
+								   
+								   exit 2
+								
+								fi   
+                            
+							done
+			
+				done < "$DOWN_IP"
+				
+				rm -f "$DOWN_IP"
+				
+				echo  " Successful bring up  all down nodes." >&2
+						
+		else 
+			     
+				 echo " There no nodes down in the DSE ring"  >&2  
+		
+		fi
+		
+		rm -f "$TMPFILE"
+        
+else
+    
+        echo "There are NO NODES up according to dsetool detect in ring:" >&2 
+		
+		cat "$TMPFILE" >&2
+		
+		rm -f "$TMPFILE"
+		
+		echo "Aborting reboot sequence in VENPRODTX Data Center." >&2
+		
+		exit 2
+
+fi
+
+echo "Tests passed; next server reboot may proceed in VENPRODTX Data Center ." >&2
+
+exit 0
+
+#END

@@ -1,0 +1,541 @@
+#!/bin/bash
+
+##########################################################
+#
+#   Version: 2.0.4  (Dev-Version: 6.9.2)
+#
+#
+#  Ver 2.0.2 : OPS_SER_TEST value has been changed filter out "opscenter-agent"
+#  Ver 2.0.1 : Find latest version number of DSE, "ps -ef" change to "ps aux"
+#
+#  Ver 2.0.0 : Changed script use root privilege to run
+#                                 added Capture server hardware information.
+#                                 added Detect machine is Physical or Virtual.
+#                    (Must to have command "facter" in Puppet installed)
+#                                 CheckUp Server is Cassadra Server or Not.
+#                    Detect Machine is Cassadra DB or Utility server.
+#                                 Modify nodetool command and running it under root privilege.
+#                                 added All Software and Driver list on the Local Machine.
+#
+#  Ver 1.0.0:  Collection Informations:
+#                                 Cluster Name, Environment, AIT number.
+#                                 Number of  version DSE installed, List versions of DSE installed
+#                                 Number of Runing DSE , List  DSE versions in running,
+#                                 Number of opscenter-agent installed, List version of opscenter-agent installed
+#                                 Number of Running opscenter-agent, List version of opscenter-agent in Running,
+#                                 Opscenter server running status .
+#                                 Added read array function to get Versions
+#
+###########################################################
+
+
+##################
+# debug Mode  on "set -x"
+# debug mode off  " set +x"
+##################
+
+#set -x
+
+###########################
+#
+# Printout file can be converted to MS Excel
+#
+###########################
+
+function ait-report {
+       printf  "%14s%16s%10s%12s%14s%18s%10s%16s%22s%22s%18s%28s%24s%24s%24s%24s\n" "Host_Name" "IP_Addr" "OS_Type" "DSE_Running"\
+           "Environment" "DB/UTILI_Server" "AIT" "OS_Version" "DSE_ClusterName" "Ops_Console_running"\
+           "#_DSE_Instances" "Ops_Config_Version"\
+           "Ver-of-Opscenter-Agent" "DSE_CFG_VER" "DSE_RUN_VER" "OS_Hardware" | tee /tmp/ait-report.$DATE_STAMP
+       printf  "%14s%16s%10s%12s%14s%18s%10s%16s%22s%22s%18s%28s%24s%24s%24s%24s\n" "$HOST_NAME" "$IP_ADDR" "$VIR_PHY" "$CASSA_SER"\
+           "$ENV" "$UTIL_DB_SER" "$AIT_NB" "$OS_VER_SMP" "$CLUTER_NAME" "$OPS_SER,$OPS_SER_VER"\
+           "$NB_RUN_DSE" "${AGT_CFG[*]}" "${AGT_RUN[*]}" "${DSE_CFG[*]}" "${DSE_RUN[*]}" "$Sys_Hard_Info"\
+           | tee --append /tmp/ait-report.$DATE_STAMP
+}
+
+###################################
+#
+# Read input file $INPUTFILER by each line and assigne
+# each element data (Versions) to array $OUTPUTFIE[i].
+#
+###################################
+
+function array-out {
+
+i=0
+
+while read -ru 3  LINE; do
+
+     OUTPUTFILE[i]=`echo "$LINE"`          2>&1
+
+i=$((i + 1))
+
+done 3< "$INPUTFILE"
+
+}
+
+###############
+#
+#   Main script
+#
+###############
+
+#   Initialization
+
+typeset DSE_BASE="/hosting/products/datastax"
+typeset VERTEMP="$(mktemp)"
+ls -l $DSE_BASE |  grep dse- | awk '{print $9}' | cut -d '-' -f 2 > "$VERTEMP"  2>&1
+typeset DSE_VER=$(cat $VERTEMP | sort -nr | head -n1)
+rm  -f  $VERTEMP
+typeset DSE_DIR="$DSE_BASE/dse-$DSE_VER"
+typeset NODETOOL="/home/casadmin/bin/nosql-nodetool"
+#CQLSH="/home/casadmin/bin/cqlsh-c0"
+typeset CQLSH="$DSE_DIR/c0/dse-$DSE_VER/bin/cqlsh"
+typeset DATE_STAMP=$( date "+%Y%m%d%H%M" )
+typeset INTRO_DIR="/hosting/products/introscope/core/config/bofa/"
+typeset PROPERTY="TESTAUTHHUB.properties"
+typeset CASSA_DIR="/tmp/cassa-inventory"
+typeset SIP="Software-Installed-Packages"
+typeset LDD="List-Device-Drivers"
+typeset LINUX=
+typeset ENV=
+typeset AIT_NB=
+typeset UMID=
+typeset OS_VERSION=
+typeset OS_NAME=
+typeset HOST_NAME=
+typeset Function=
+typeset CONFIRMED=
+typeset ALIVE_DATE=
+typeset USERS=
+typeset CLUTER_NAME=
+typeset DSE_VER_NUB=
+typeset APPLICATION=
+typeset OPS_SER=
+typeset OPS_AGENT=
+typeset Sys_Hard_Info=
+typeset VIR_PHY=
+typeset CASSA_SER=
+typeset UTIL_DB_SER=
+typeset OS_BRN=
+typeset OPS_SER_VER=
+######################
+#
+# Check if user is logged in as root
+#
+# #####################
+
+#[ $(id -u) -eq 0 ] && exec su - casadmin "$(pwd)/$0" "$@"
+
+if test "`id|sed 's/(.*$//'`" != "uid=0"
+
+then
+     echo "You must have root privileges to run this script. Exiting ...."  >&2
+     exit 1
+fi
+
+######################
+#
+# Detect Introscope installed or Not
+#
+######################
+
+if [ ! -d "/hosting/products/introscope/core/config/bofa" ]
+
+then
+        echo "Introscope tool not installed in this server, Please install Introscope Tool first. Exiting ...."  >&2
+        exit 1
+fi
+
+###################
+#
+# Make an Inventory Directory
+#
+###################
+
+if [ ! -d "$CASSA_DIR" ]
+
+then
+
+ mkdir -p $CASSA_DIR
+
+fi
+
+echo "The Inventory of Cassadra Data Collaction Directory on $CASSA_DIR."  >&2
+echo "Waiting......."
+
+
+[ -x "$NODETOOL" ] || {
+
+        echo "ERROR: Unable to execute $NODETOOL." >&2
+
+        echo "Aborting reboot sequence." >&2
+
+        exit 1
+
+   }
+#####################
+##
+## Detect and make a computing
+##
+#####################
+
+###########################################
+#
+#  $NB_DSE show How many Cassandra DSE installed on Machine
+#  $NB_RUN_DSE shows How many Running DSE(Nodes) on machine
+#
+###########################################
+
+typeset -i NB_DSE=$(ls -l $DSE_DIR | grep -v total |  wc -l)
+
+typeset -i NB_RUN_DSE=$(ps aux | grep cassandra | grep -v grep | grep -v opscenter | wc -l)
+
+####################
+#
+# Cassadra server (Y/N) ?
+#
+####################
+
+if [ $NB_RUN_DSE  != "0" ]; then
+
+    CASSA_SER="Yes"
+
+else
+
+        CASSA_SER="No"
+
+fi
+
+ ############################
+#
+# Collaction Version of DSE installed in Server
+#
+############################
+
+typeset INPUTFILE="$(mktemp)"
+
+        ls -l $DSE_BASE | grep dse | grep dse | awk '{print$9}' | cut -d '-' -f 2  | sed s'/$/;/' > $INPUTFILE  2>&1
+
+if [ -s $INPUTFILE ]; then
+
+    cp $INPUTFILE  $CASSA_DIR/DSE-installed-versions-list-$DATE_STAMP
+
+else
+
+        echo "None" > $INPUTFILE
+
+fi
+
+###############################
+#
+# Call function to have DSE config Version
+# DSE_CFG is versions of DSE installed in server
+#
+###############################
+
+array-out
+
+########################
+#
+# Copy $OUTPUTFILE Array to Print
+# $DSE_CFG[*] for print
+#
+########################
+
+DSE_CFG=(${OUTPUTFILE[*]})
+
+rm   $INPUTFILE
+
+#######################
+#
+# Delete an entire array OUPTUFILE[]
+#
+#######################
+
+unset  OUTPUTFILE
+
+###########################
+#
+# Collaction Version of DSE Running in Server
+#
+###########################
+
+typeset INPUTFILE="$(mktemp)"
+
+        ps aux | grep cassandra | grep -v grep | grep -v opscenter | sed 's/.*-//' | cut -d '/' -f 1 | sed s'/$/;/' > $INPUTFILE  2>&1
+
+if [ -s $INPUTFILE ]; then
+
+   cp $INPUTFILE  $CASSA_DIR/DSE-running-versions-list-$DATE_STAMP
+
+   else
+
+                echo "None" > $INPUTFILE
+
+fi
+
+######################################
+#
+# Call function to have DSE Run Version
+# DSE_RUN is versions of DSE Running in server
+# Read Input file ,then call Output Function to have Versions.
+#
+######################################
+
+array-out
+
+########################
+#
+# Copy $OUTPUTFILE Array to
+#          $DSE_CFG[*] for print
+#
+########################
+
+DSE_RUN=(${OUTPUTFILE[*]})
+
+rm   $INPUTFILE
+
+########################
+#
+# Delete an entire array OUPTUFILE[]
+#
+########################
+
+unset  OUTPUTFILE
+
+###########################
+#
+# Check OpsCenter server Running or Not
+# DB Server:  UTIL_DB_SER="DB"
+# UTILITY Server: UTIL_DB_SER="UTIL"
+#
+#  $AGT_CFG is installed Versions of OPS agent.
+#  $AGT_RUN is the Version of Running Opscenter-agent
+#  $NB_OPS_RUN_AGT: number of opscenter-agent in Running
+#  $NB_OPS_INS_AGT: number of opscenter-agent installed in machine
+#  Check Ops Agent Version at directory.
+#  /hosting/products/datastax/opscenter-agent-***
+#
+######################################
+
+typeset -i OPS_SER_TEST=$(ps aux | grep opscenter | grep -v grep | grep -v opscenter-agent | wc -l)
+
+if [ $OPS_SER_TEST -eq 0 ]; then
+
+        rm -f "$TMPFILE"
+
+     OPS_SER="None"
+
+     UTIL_DB_SER="DB"
+	 
+	 OPS_SER_VER="No-Version#"
+
+else
+
+    OPS_SER="Yes"
+
+    UTIL_DB_SER="UTIL"
+	
+	OPS_SER_VER=Version:$(ps aux | grep opscenter | grep -v grep | grep -v opscenter-agent | cut -d '/' -f 12 | cut -d '-' -f 2)
+
+fi
+
+########################
+#
+# Number of opscenter-agent installed
+#
+########################
+
+NB_OPS_INS_AGT=$(ls -l $DSE_BASE | grep opscenter-agent |wc -l)  2>&1
+
+######################################
+#
+# Check Opscenter Agent Installed or Not
+# $AGT_CFG is the array file of Opscenter-agent versions list
+#
+######################################
+
+typeset INPUTFILE="$(mktemp)"
+
+ls -l $DSE_BASE | grep opscenter-agent | awk '{print $9}'  | cut -d '-' -f 3 | sed s'/$/;/' > $INPUTFILE 2>&1
+
+if [ -s $INPUTFILE ]; then
+
+    cp $INPUTFILE  $CASSA_DIR/opscerter-agent-installed-versions-list-$DATE_STAMP
+
+        else
+
+                echo "None" > $INPUTFILE
+
+fi
+
+#####################################
+#
+# Read Input file ,then call Output Function to have Versions.
+#
+#####################################
+
+array-out
+
+####################
+#
+# Copy $OUTPUTFILE Array to
+#         $AGT_CFG[*] for print
+#
+####################
+
+AGT_CFG=(${OUTPUTFILE[*]})
+
+rm   $INPUTFILE
+
+#######################
+#
+# Delete an entire array OUPTUFILE[]
+#
+#######################
+
+unset OUTPUTFILE
+
+########################
+#
+# Number of running Opscenter-agent
+#
+########################
+
+typeset -i NB_OPS_RUN_AGT=$(ps aux | grep opscenter-agent | grep -v grep | wc -l)
+
+typeset INPUTFILE="$(mktemp)"
+
+    ps aux | grep opscenter-agent | grep -v grep | sed 's/.*-//' |  cut -d '/' -f 1 | sed s'/$/;/' > $INPUTFILE  2>&1
+
+if [ -s  $INPUTFILE ]; then
+
+   cp  $INPUTFILE  $CASSA_DIR/opscerter-agent-running-versions-list-$DATE_STAMP
+
+else
+
+                echo "None" > $INPUTFILE
+
+fi
+
+############################
+#
+#  Show up  Device Drivers In the Linux Kernel
+#
+############################
+
+lsmod  > $CASSA_DIR/$LDD-$DATE_STAMP
+
+################################
+#
+# List application software installed in Linux System
+# without showing Lib*.* and yum*.* packages
+#
+################################
+
+rpm -qa --last | grep -v lib*.* | grep -v yum*.*  > $CASSA_DIR/$SIP-$DATE_STAMP
+
+#####################################
+#
+# Read Input file ,then call Output Function to have Versions.
+#
+#####################################
+
+array-out
+
+########################
+#
+# Copy $OUTPUTFILE Array to Print
+# $AGT_CFG[*] for print
+#
+########################
+
+AGT_RUN=(${OUTPUTFILE[*]})
+
+rm   $INPUTFILE
+
+#######################
+#
+# Delete an entire array OUPTUFILE[]
+#
+#######################
+
+unset  OUTPUTFILE
+
+##########################
+#
+# run command and assign to each value
+#
+##########################
+
+OS_NAME=`uname -s`
+IP_ADDR=`hostname -i`
+HOST_NAME=`hostname -s`
+OS_VERSION=`grep release < /etc/redhat-release`
+OS_BRN=`echo $OS_VERSION | cut -c1-25`
+if [ "$(OS_BRN)"="Red Hat Enterprise Linux" ];then
+
+  OS_VER_SMP=RHEL`cat /etc/redhat-release | awk '{print $7}'`
+
+else
+
+ OS_VER_SMP=Linux`cat /etc/redhat-release | awk '{print $7}'`
+
+ fi
+
+LINUX=`cat /etc/*release | awk '{print $1 $2}'`
+ALIVE_DATE=`uptime | awk '{print $3, $4}'`
+USERS=`uptime | awk '{print $6, $7}'`
+AIT_NB=`grep customPN  < $INTRO_DIR/$PROPERTY | cut -d '=' -f 2 | sed s'/m/m;/' | cut -d ';' -f 1 | sed s'/a//' | sed s'/m//'`
+ENV=`grep customPN  < $INTRO_DIR/$PROPERTY | cut -c23-26`
+APPLICATION=`grep customPN  < $INTRO_DIR/$PROPERTY | cut -c27-33`
+UMID=`grep customPN  < $INTRO_DIR/$PROPERTY | cut -c17-22`
+CLUTER_NAME=$("$NODETOOL" c0 $* describecluster | grep Name | awk '{print $2}')
+DSE_VER_NUB=$("$DSE_DIR"/c0/"dse-$DSE_VER"/bin/dse -v)
+Sys_Hard_Info=`/usr/sbin/dmidecode -s system-product-name`
+
+typeset TMPFILE="$(mktemp)"
+
+rpm -qa | grep puppet > $TMPFILE
+
+if [ -s $TMPFILE ]; then
+
+   VIR_PHY=`facter virtual`
+
+   else
+
+                 echo "No facter command insalled, Cann't detect Virtual or Physical Machine"
+
+fi
+
+rm  $TMPFILE
+
+###############
+#
+# Call report Function
+#
+###############
+
+ait-report
+
+##################
+#
+# Make update report in /tmp
+#
+##################
+typeset UPDATE_REPORT=$(ls -l /tmp/ait-report.* | sort -nr | head -n1 | awk '{print $9}')
+
+cp -fp $UPDATE_REPORT /tmp/ait-latest-report
+
+###################
+#
+# Note: zko9ycn is Frank Zhang Use ID
+# you may change it to your ID  for Opration
+#
+###################
+chown zko9ycn /tmp/ait-latest-report
+
+#rm -f /tmp/ait-report.*
+
+# End of Script
